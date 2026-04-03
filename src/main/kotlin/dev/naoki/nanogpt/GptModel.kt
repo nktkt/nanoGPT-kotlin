@@ -90,12 +90,12 @@ class CausalSelfAttentionBlock(private val config: GptConfig) : AbstractBlock(VE
 class TransformerBlock(private val config: GptConfig) : AbstractBlock(VERSION) {
     private val ln1 = addChildBlock(
         "ln_1",
-        LayerNorm.builder().optCenter(config.bias).optScale(true).build(),
+        LayerNorm.builder().axis(2).optCenter(config.bias).optScale(true).build(),
     )
     private val attn = addChildBlock("attn", CausalSelfAttentionBlock(config))
     private val ln2 = addChildBlock(
         "ln_2",
-        LayerNorm.builder().optCenter(config.bias).optScale(true).build(),
+        LayerNorm.builder().axis(2).optCenter(config.bias).optScale(true).build(),
     )
     private val mlp = addChildBlock(
         "mlp",
@@ -151,7 +151,7 @@ class GptModel(private val config: GptConfig) : AbstractBlock(VERSION) {
     }
     private val finalNorm = addChildBlock(
         "ln_f",
-        LayerNorm.builder().optCenter(config.bias).optScale(true).build(),
+        LayerNorm.builder().axis(2).optCenter(config.bias).optScale(true).build(),
     )
 
     override fun getOutputShapes(inputShapes: Array<Shape>): Array<Shape> {

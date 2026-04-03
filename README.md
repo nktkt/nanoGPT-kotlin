@@ -1,68 +1,158 @@
 # nanoGPT Kotlin
 
-This project is a Kotlin/JVM port of the core ideas in `karpathy/nanoGPT`. It includes a GPT model comparable to `model.py`, a training CLI comparable to `train.py`, a sampling CLI comparable to `sample.py`, and a simple character-level dataset preparation CLI.
+`nanoGPT-kotlin` is a Kotlin/JVM implementation of the core nanoGPT workflow. It can prepare character-level datasets, train a causal decoder-only transformer, resume from saved weights, inspect checkpoints, and generate text from saved models.
 
-The implementation runs on the JVM using the [DJL](https://djl.ai/) PyTorch engine. It is not a literal 1:1 translation of the original Python code. Instead, it rebuilds the same model structure and workflow in Kotlin.
+The runtime uses [DJL](https://djl.ai/) with the PyTorch engine, so the project stays on the JVM while still using a mature tensor backend.
 
-## Features
+## What This Product Includes
 
-- Train a GPT model from scratch
-- Causal self-attention, pre-LN, GELU, residual connections, and dropout
-- Weight tying between token embeddings and the language-model head
-- Read `train.bin` and `val.bin` datasets stored as raw `uint16`
-- Text generation with temperature and top-k sampling
-- Prepare character-level datasets from plain text
+- A runnable CLI with `prepare`, `train`, `sample`, and `inspect` commands
+- Scratch training for GPT-style decoder models
+- Character-level dataset preparation to `train.bin`, `val.bin`, and `vocab.txt`
+- Weight tying, causal self-attention, GELU MLP blocks, dropout, and pre-layer normalization
+- Automatic checkpoint layout with `best/` and `latest/`
+- Weight-based resume support from `latest/` checkpoints
+- Executable shaded jar output from `mvn package`
 
-## Not Implemented Yet
+## Current Limits
 
-- DDP or multi-node training
-- `torch.compile`
-- GPT-2 pretrained weight import
-- Exact resume support including optimizer state
-- W&B logging
+- Resume restores model weights and training metadata, but not optimizer state
+- Character-level preparation is included; GPT-2-tokenized dataset preparation is not
+- DDP, `torch.compile`, pretrained GPT-2 import, and W&B logging are still out of scope
 
 ## Build
 
 ```bash
 cd nanoGPT-kotlin
-mvn compile
+mvn package
 ```
 
-On first run, DJL may download the required PyTorch runtime for your platform. If you need a fully offline setup, add the appropriate runtime dependency to `pom.xml`.
-
-## Prepare a Character Dataset
-
-You can generate `train.bin`, `val.bin`, and `vocab.txt` from any plain text file.
+This produces a runnable jar at:
 
 ```bash
-mvn -q -Dexec.mainClass=dev.naoki.nanogpt.PrepareTextCli exec:java \
-  -Dexec.args="--input=/path/to/input.txt --output_dir=data/shakespeare_char"
+target/nanogpt-kotlin-1.0.0.jar
 ```
+
+You can also run the CLI without packaging:
+
+```bash
+mvn -q -Dexec.mainClass=dev.naoki.nanogpt.NanoGptCli exec:java -Dexec.args="--help"
+```
+
+On first run, DJL may download the required PyTorch runtime for your platform.
+
+## CLI Overview
+
+```bash
+java -jar target/nanogpt-kotlin-1.0.0.jar --help
+```
+
+Available commands:
+
+- `prepare`
+- `train`
+- `sample`
+- `inspect`
+
+## Prepare a Dataset
+
+```bash
+java -jar target/nanogpt-kotlin-1.0.0.jar prepare \
+  --input=/path/to/input.txt \
+  --output_dir=data/shakespeare_char \
+  --train_split=0.9
+```
+
+Output files:
+
+- `train.bin`
+- `val.bin`
+- `vocab.txt`
 
 ## Train
 
-```bash
-mvn -q -Dexec.mainClass=dev.naoki.nanogpt.TrainCli exec:java \
-  -Dexec.args="configs/train-shakespeare-char.properties"
-```
-
-The CLI supports both `.properties` config files and `--key=value` overrides.
-
-Example:
+You can train from a config file:
 
 ```bash
-mvn -q -Dexec.mainClass=dev.naoki.nanogpt.TrainCli exec:java \
-  -Dexec.args="configs/train-shakespeare-char.properties --device=cpu --max_iters=2000"
+java -jar target/nanogpt-kotlin-1.0.0.jar train \
+  configs/train-shakespeare-char.properties
 ```
+
+Or with explicit overrides:
+
+```bash
+java -jar target/nanogpt-kotlin-1.0.0.jar train \
+  --dataset_dir=data/shakespeare_char \
+  --out_dir=out-shakespeare-char \
+  --device=cpu \
+  --batch_size=64 \
+  --block_size=256 \
+  --n_layer=6 \
+  --n_head=6 \
+  --n_embd=384 \
+  --max_iters=5000
+```
+
+Training writes checkpoints to:
+
+- `out-shakespeare-char/latest`
+- `out-shakespeare-char/best`
+
+## Resume Training
+
+Resume from a previous run by pointing `resume_from` at the output directory or directly at a checkpoint slot:
+
+```bash
+java -jar target/nanogpt-kotlin-1.0.0.jar train \
+  --dataset_dir=data/shakespeare_char \
+  --out_dir=out-shakespeare-char-resumed \
+  --resume_from=out-shakespeare-char \
+  --device=cpu \
+  --max_iters=8000
+```
+
+If you pass the root output directory, resume automatically prefers `latest/`.
+
+## Inspect a Checkpoint
+
+```bash
+java -jar target/nanogpt-kotlin-1.0.0.jar inspect \
+  --checkpoint_dir=out-shakespeare-char
+```
+
+If you pass the root output directory, inspection automatically resolves to `best/`.
 
 ## Sample
 
+Generate text from a checkpoint:
+
 ```bash
-mvn -q -Dexec.mainClass=dev.naoki.nanogpt.SampleCli exec:java \
-  -Dexec.args="--checkpoint_dir=out-shakespeare-char --start=$'\n' --num_samples=3 --max_new_tokens=300"
+java -jar target/nanogpt-kotlin-1.0.0.jar sample \
+  --checkpoint_dir=out-shakespeare-char \
+  --start=$'\n' \
+  --num_samples=3 \
+  --max_new_tokens=300 \
+  --temperature=0.8 \
+  --top_k=200
 ```
 
-If `vocab.txt` is present in the checkpoint directory, the sampler uses the character-level codec. Otherwise, it falls back to a GPT-style tokenizer.
+You can also load the prompt from a file:
+
+```bash
+java -jar target/nanogpt-kotlin-1.0.0.jar sample \
+  --checkpoint_dir=out-shakespeare-char \
+  --start_file=/path/to/prompt.txt
+```
+
+If you pass the root output directory, sampling automatically resolves to `best/`.
+
+## Example Config
+
+The repository includes a starter config:
+
+```bash
+configs/train-shakespeare-char.properties
+```
 
 ## Push to a New GitHub Repository
 

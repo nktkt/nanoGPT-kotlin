@@ -12,6 +12,22 @@ import kotlin.io.path.readText
 object PrepareTextCli {
     @JvmStatic
     fun main(args: Array<String>) {
+        if (Cli.wantsHelp(args)) {
+            Cli.printUsage(
+                listOf(
+                    "Usage: prepare [--key=value ...]",
+                    "",
+                    "Required:",
+                    "  --input=/path/to/input.txt",
+                    "",
+                    "Common options:",
+                    "  --output_dir=data/shakespeare_char",
+                    "  --train_split=0.9",
+                ),
+            )
+            return
+        }
+
         val values = Cli.loadOverrides(args)
         val config = PrepareConfig(
             input = Cli.requirePath(values, "input"),
@@ -20,6 +36,7 @@ object PrepareTextCli {
         )
 
         val text = config.input.readText(StandardCharsets.UTF_8)
+        require(text.length >= 2) { "input text must contain at least 2 characters" }
         val codec = CharacterCodec.fromText(text)
         val encoded = codec.encode(text)
         require(codec.vocabSize <= 65535) { "Character vocab exceeds uint16 capacity: ${codec.vocabSize}" }

@@ -4,6 +4,14 @@ import java.nio.file.Path
 import kotlin.io.path.Path
 
 object Cli {
+    fun wantsHelp(args: Array<String>): Boolean {
+        return args.any { it == "-h" || it == "--help" || it == "help" }
+    }
+
+    fun printUsage(lines: List<String>) {
+        lines.forEach(::println)
+    }
+
     fun loadOverrides(args: Array<String>): Map<String, String> {
         val overrides = linkedMapOf<String, String>()
         args.filter { !it.startsWith("--") && it.endsWith(".properties") }

@@ -1,9 +1,10 @@
 package dev.naoki.nanogpt
 
 import ai.djl.Model
+import ai.djl.ndarray.NDList
+import ai.djl.ndarray.types.Shape
 import ai.djl.nn.Parameter
 import ai.djl.training.DefaultTrainingConfig
-import ai.djl.training.GradientCollector
 import ai.djl.training.Trainer
 import ai.djl.training.initializer.Initializer
 import ai.djl.training.initializer.NormalInitializer
@@ -12,17 +13,39 @@ import ai.djl.training.optimizer.Optimizer
 import ai.djl.training.tracker.Tracker
 import ai.djl.training.tracker.WarmUpTracker
 import java.nio.file.Files
-import java.util.Properties
 import kotlin.io.path.Path
+import kotlin.io.path.isDirectory
 import kotlin.random.Random
 
 object TrainCli {
     @JvmStatic
     fun main(args: Array<String>) {
+        if (Cli.wantsHelp(args)) {
+            Cli.printUsage(
+                listOf(
+                    "Usage: train [config.properties] [--key=value ...]",
+                    "",
+                    "Required:",
+                    "  --dataset_dir=/path/to/dataset",
+                    "",
+                    "Common options:",
+                    "  --out_dir=out-shakespeare-char",
+                    "  --resume_from=/path/to/out/latest",
+                    "  --device=cpu",
+                    "  --batch_size=64",
+                    "  --block_size=256",
+                    "  --n_layer=6 --n_head=6 --n_embd=384",
+                    "  --eval_interval=250 --eval_iters=50 --max_iters=5000",
+                ),
+            )
+            return
+        }
+
         val values = Cli.loadOverrides(args)
         val config = TrainConfig(
             datasetDir = Cli.requirePath(values, "dataset_dir"),
             outDir = values["out_dir"]?.let(::Path) ?: Path("out"),
+            resumeFrom = values["resume_from"]?.let(::Path),
             evalInterval = Cli.int(values, "eval_interval", 250),
             logInterval = Cli.int(values, "log_interval", 10),
             evalIters = Cli.int(values, "eval_iters", 50),
@@ -49,24 +72,31 @@ object TrainCli {
             seed = Cli.int(values, "seed", 1337),
         )
 
+        require(config.datasetDir.isDirectory()) { "dataset_dir does not exist: ${config.datasetDir}" }
         Files.createDirectories(config.outDir)
 
         TokenDataset(config.datasetDir).use { dataset ->
-            val vocabSize = dataset.inferredVocabSize()
+            val resumeDir = config.resumeFrom?.let(Checkpoints::resolveForResume)
+            val resumeMetadata = resumeDir?.let(Checkpoints::loadMetadata)
+            val datasetVocabSize = dataset.inferredVocabSize()
                 ?: values["vocab_size"]?.toInt()
+                ?: resumeMetadata?.modelConfig?.vocabSize
                 ?: error("Could not infer vocab size. Provide --vocab_size or include vocab.txt in dataset_dir.")
-            val modelConfig = config.toModelConfig(vocabSize)
-            val loss = SoftmaxCrossEntropyLoss("token_loss", 1f, -1, true, false)
-            val tracker = buildTracker(config)
+            val modelConfig = resumeMetadata?.modelConfig ?: config.toModelConfig(datasetVocabSize)
+            require(modelConfig.vocabSize == datasetVocabSize) {
+                "Checkpoint vocab_size=${modelConfig.vocabSize} does not match dataset vocab_size=$datasetVocabSize"
+            }
+
+            val tokenLoss = SoftmaxCrossEntropyLoss("token_loss", 1f, 1, true, false)
             val optimizer = Optimizer.adamW()
-                .optLearningRateTracker(tracker)
+                .optLearningRateTracker(buildTracker(config))
                 .optBeta1(config.beta1)
                 .optBeta2(config.beta2)
                 .optWeightDecays(config.weightDecay)
                 .optClipGrad(config.gradClip)
                 .build()
 
-            val trainingConfig = DefaultTrainingConfig(loss)
+            val trainingConfig = DefaultTrainingConfig(tokenLoss)
                 .optDevices(arrayOf(config.deviceHandle()))
                 .optOptimizer(optimizer)
                 .optInitializer(NormalInitializer(0.02f), Parameter.Type.WEIGHT)
@@ -77,43 +107,75 @@ object TrainCli {
             Model.newInstance(CheckpointFiles.MODEL_PREFIX, "PyTorch").use { model ->
                 model.block = GptModel(modelConfig)
                 model.newTrainer(trainingConfig).use { trainer ->
-                    trainer.initialize(
-                        ai.djl.ndarray.types.Shape(config.batchSize.toLong(), config.blockSize.toLong()),
-                    )
+                    trainer.initialize(Shape(config.batchSize.toLong(), config.blockSize.toLong()))
+                    if (resumeDir != null) {
+                        model.load(resumeDir, CheckpointFiles.MODEL_PREFIX)
+                        println("resumed_from=$resumeDir")
+                        println("resume_note=optimizer state is reinitialized; weight resume only")
+                    }
+
+                    val codec = dataset.checkpointCodec()
                     val numParams = countParameters(model)
                     println("parameters=${"%.2f".format(numParams / 1_000_000.0)}M")
 
-                    val trainingRandom = Random(config.seed)
-                    val validationRandom = Random(config.seed + 1)
-                    var bestValLoss = Float.POSITIVE_INFINITY
+                    var completedIters = resumeMetadata?.trainingState?.iter ?: 0
+                    var bestValLoss = resumeMetadata?.trainingState?.bestValLoss ?: Float.POSITIVE_INFINITY
+                    val trainingRandom = Random(config.seed + completedIters)
+                    val trainEvalRandom = Random(config.seed + 1)
+                    val valEvalRandom = Random(config.seed + 2)
                     var lastLogTime = System.nanoTime()
 
-                    saveMetadata(config.outDir, modelConfig, dataset.checkpointCodec(), 0, bestValLoss)
+                    Checkpoints.save(
+                        model,
+                        Checkpoints.latestDir(config.outDir),
+                        modelConfig,
+                        codec,
+                        TrainingState(completedIters, bestValLoss),
+                    )
 
-                    for (iter in 0..config.maxIters) {
-                        if (iter % config.evalInterval == 0) {
-                            val trainLoss = estimateLoss(trainer, dataset, Split.TRAIN, config, validationRandom)
-                            val valLoss = estimateLoss(trainer, dataset, Split.VAL, config, validationRandom)
-                            println("step $iter: train loss ${"%.4f".format(trainLoss)}, val loss ${"%.4f".format(valLoss)}")
-                            if (valLoss < bestValLoss || config.alwaysSaveCheckpoint) {
+                    while (true) {
+                        if (completedIters % config.evalInterval == 0) {
+                            val trainLoss = estimateLoss(trainer, tokenLoss, dataset, Split.TRAIN, config, trainEvalRandom)
+                            val valLoss = estimateLoss(trainer, tokenLoss, dataset, Split.VAL, config, valEvalRandom)
+                            if (valLoss < bestValLoss) {
                                 bestValLoss = valLoss
-                                if (iter > 0) {
-                                    saveCheckpoint(model, config.outDir, modelConfig, dataset.checkpointCodec(), iter, bestValLoss)
-                                }
                             }
-                            if (iter == 0 && config.evalOnly) {
+
+                            val state = TrainingState(completedIters, bestValLoss)
+                            Checkpoints.save(model, Checkpoints.latestDir(config.outDir), modelConfig, codec, state)
+                            if (valLoss <= bestValLoss || config.alwaysSaveCheckpoint) {
+                                Checkpoints.save(model, Checkpoints.bestDir(config.outDir), modelConfig, codec, state)
+                            }
+                            println(
+                                "step $completedIters: train loss ${"%.4f".format(trainLoss)}, " +
+                                    "val loss ${"%.4f".format(valLoss)}",
+                            )
+                            if (config.evalOnly) {
                                 break
                             }
                         }
 
-                        val lossValue = trainIteration(trainer, dataset, config, trainingRandom)
-                        if (iter % config.logInterval == 0) {
+                        if (completedIters >= config.maxIters) {
+                            break
+                        }
+
+                        val lossValue = trainIteration(trainer, tokenLoss, dataset, config, trainingRandom)
+                        completedIters += 1
+                        if (completedIters % config.logInterval == 0) {
                             val now = System.nanoTime()
                             val millis = (now - lastLogTime) / 1_000_000.0
                             lastLogTime = now
-                            println("iter $iter: loss ${"%.4f".format(lossValue)}, time ${"%.2f".format(millis)}ms")
+                            println("iter $completedIters: loss ${"%.4f".format(lossValue)}, time ${"%.2f".format(millis)}ms")
                         }
                     }
+
+                    Checkpoints.save(
+                        model,
+                        Checkpoints.latestDir(config.outDir),
+                        modelConfig,
+                        codec,
+                        TrainingState(completedIters, bestValLoss),
+                    )
                 }
             }
         }
@@ -139,6 +201,7 @@ object TrainCli {
 
     private fun trainIteration(
         trainer: Trainer,
+        tokenLoss: SoftmaxCrossEntropyLoss,
         dataset: TokenDataset,
         config: TrainConfig,
         random: Random,
@@ -154,8 +217,8 @@ object TrainCli {
                     blockSize = config.blockSize,
                     random = random,
                 ).use { batch ->
-                    val predictions = trainer.forward(ai.djl.ndarray.NDList(batch.data), ai.djl.ndarray.NDList(batch.labels))
-                    val lossValue = trainer.loss.evaluate(ai.djl.ndarray.NDList(batch.labels), predictions)
+                    val predictions = trainer.forward(NDList(batch.data))
+                    val lossValue = evaluateTokenLoss(tokenLoss, batch.labels, predictions)
                     totalLoss += lossValue.getFloat()
                     collector.backward(lossValue.div(config.gradientAccumulationSteps.toFloat()))
                 }
@@ -167,6 +230,7 @@ object TrainCli {
 
     private fun estimateLoss(
         trainer: Trainer,
+        tokenLoss: SoftmaxCrossEntropyLoss,
         dataset: TokenDataset,
         split: Split,
         config: TrainConfig,
@@ -182,49 +246,23 @@ object TrainCli {
                 blockSize = config.blockSize,
                 random = random,
             ).use { batch ->
-                val predictions = trainer.evaluate(ai.djl.ndarray.NDList(batch.data))
-                total += trainer.loss.evaluate(ai.djl.ndarray.NDList(batch.labels), predictions).getFloat()
+                val predictions = trainer.evaluate(NDList(batch.data))
+                total += evaluateTokenLoss(tokenLoss, batch.labels, predictions).getFloat()
             }
         }
         return total / config.evalIters
     }
 
-    private fun saveCheckpoint(
-        model: Model,
-        outDir: java.nio.file.Path,
-        modelConfig: GptConfig,
-        codec: TextCodec,
-        iter: Int,
-        bestValLoss: Float,
-    ) {
-        model.save(outDir, CheckpointFiles.MODEL_PREFIX)
-        saveMetadata(outDir, modelConfig, codec, iter, bestValLoss)
-    }
-
-    private fun saveMetadata(
-        outDir: java.nio.file.Path,
-        modelConfig: GptConfig,
-        codec: TextCodec,
-        iter: Int,
-        bestValLoss: Float,
-    ) {
-        val modelProperties = Properties().apply {
-            setProperty("block_size", modelConfig.blockSize.toString())
-            setProperty("vocab_size", modelConfig.vocabSize.toString())
-            setProperty("n_layer", modelConfig.nLayer.toString())
-            setProperty("n_head", modelConfig.nHead.toString())
-            setProperty("n_embd", modelConfig.nEmbd.toString())
-            setProperty("dropout", modelConfig.dropout.toString())
-            setProperty("bias", modelConfig.bias.toString())
-            setProperty("codec", codec.type)
-        }
-        val stateProperties = Properties().apply {
-            setProperty("iter", iter.toString())
-            setProperty("best_val_loss", bestValLoss.toString())
-        }
-        PropertiesIO.store(outDir.resolve(CheckpointFiles.MODEL_PROPERTIES), modelProperties, "nanoGPT Kotlin model config")
-        PropertiesIO.store(outDir.resolve(CheckpointFiles.STATE_PROPERTIES), stateProperties, "nanoGPT Kotlin training state")
-        codec.copyArtifactsTo(outDir)
+    private fun evaluateTokenLoss(
+        tokenLoss: SoftmaxCrossEntropyLoss,
+        labels: ai.djl.ndarray.NDArray,
+        predictions: NDList,
+    ): ai.djl.ndarray.NDArray {
+        val logProbs = predictions.singletonOrThrow()
+        val vocabSize = logProbs.shape.get(logProbs.shape.dimension() - 1)
+        val flatLogProbs = logProbs.reshape(-1, vocabSize)
+        val flatLabels = labels.reshape(-1)
+        return tokenLoss.evaluate(NDList(flatLabels), NDList(flatLogProbs))
     }
 
     private fun countParameters(model: Model): Long {

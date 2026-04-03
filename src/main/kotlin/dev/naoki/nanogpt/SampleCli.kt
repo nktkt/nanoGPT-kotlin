@@ -3,21 +3,40 @@ package dev.naoki.nanogpt
 import ai.djl.Model
 import ai.djl.ndarray.NDList
 import ai.djl.ndarray.NDManager
-import ai.djl.ndarray.index.NDIndex
 import ai.djl.ndarray.types.Shape
 import ai.djl.training.ParameterStore
-import java.nio.file.Path
 import kotlin.io.path.Path
+import kotlin.io.path.readText
 import kotlin.random.Random
 
 object SampleCli {
     @JvmStatic
     fun main(args: Array<String>) {
+        if (Cli.wantsHelp(args)) {
+            Cli.printUsage(
+                listOf(
+                    "Usage: sample [--key=value ...]",
+                    "",
+                    "Required:",
+                    "  --checkpoint_dir=/path/to/out or /path/to/out/best",
+                    "",
+                    "Common options:",
+                    "  --start='\\n'",
+                    "  --start_file=/path/to/prompt.txt",
+                    "  --num_samples=3",
+                    "  --max_new_tokens=300",
+                    "  --temperature=0.8",
+                    "  --top_k=200",
+                ),
+            )
+            return
+        }
+
         val values = Cli.loadOverrides(args)
-        val checkpointDir = Cli.requirePath(values, "checkpoint_dir")
         val config = SampleConfig(
-            checkpointDir = checkpointDir,
+            checkpointDir = Cli.requirePath(values, "checkpoint_dir"),
             start = Cli.string(values, "start", "\n"),
+            startFile = values["start_file"]?.let(::Path),
             numSamples = Cli.int(values, "num_samples", 10),
             maxNewTokens = Cli.int(values, "max_new_tokens", 500),
             temperature = Cli.float(values, "temperature", 0.8f),
@@ -25,17 +44,16 @@ object SampleCli {
             seed = Cli.int(values, "seed", 1337),
         )
 
-        val modelConfig = loadModelConfig(checkpointDir)
-        val codec = CharacterCodec.maybeLoad(checkpointDir) ?: Gpt2Codec()
-        val prompt = if (config.start.startsWith("FILE:")) {
-            Path(config.start.removePrefix("FILE:")).toFile().readText()
-        } else {
-            config.start
+        val metadata = Checkpoints.loadMetadata(config.checkpointDir)
+        val prompt = when {
+            config.startFile != null -> config.startFile.readText()
+            config.start.startsWith("FILE:") -> Path(config.start.removePrefix("FILE:")).readText()
+            else -> config.start
         }
 
         Model.newInstance(CheckpointFiles.MODEL_PREFIX, "PyTorch").use { model ->
-            model.block = GptModel(modelConfig)
-            model.load(checkpointDir, CheckpointFiles.MODEL_PREFIX)
+            model.block = GptModel(metadata.modelConfig)
+            model.load(metadata.directory, CheckpointFiles.MODEL_PREFIX)
             NDManager.newBaseManager().use { manager ->
                 val parameterStore = ParameterStore(manager, false)
                 repeat(config.numSamples) {
@@ -43,15 +61,17 @@ object SampleCli {
                         model = model,
                         parameterStore = parameterStore,
                         manager = manager,
-                        prompt = codec.encode(prompt),
+                        prompt = metadata.codec.encode(prompt),
                         maxNewTokens = config.maxNewTokens,
-                        blockSize = modelConfig.blockSize,
+                        blockSize = metadata.modelConfig.blockSize,
                         temperature = config.temperature,
                         topK = config.topK,
                         random = Random(config.seed + it),
                     )
-                    println(codec.decode(generated))
-                    println("---------------")
+                    println(metadata.codec.decode(generated))
+                    if (it != config.numSamples - 1) {
+                        println("---------------")
+                    }
                 }
             }
         }
@@ -103,18 +123,5 @@ object SampleCli {
             }
         }
         return weights.indices.maxByOrNull { weights[it] } ?: 0
-    }
-
-    private fun loadModelConfig(checkpointDir: Path): GptConfig {
-        val props = PropertiesIO.load(checkpointDir.resolve(CheckpointFiles.MODEL_PROPERTIES))
-        return GptConfig(
-            blockSize = props.getProperty("block_size").toInt(),
-            vocabSize = props.getProperty("vocab_size").toInt(),
-            nLayer = props.getProperty("n_layer").toInt(),
-            nHead = props.getProperty("n_head").toInt(),
-            nEmbd = props.getProperty("n_embd").toInt(),
-            dropout = props.getProperty("dropout").toFloat(),
-            bias = props.getProperty("bias").toBoolean(),
-        )
     }
 }
