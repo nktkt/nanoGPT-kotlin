@@ -1,5 +1,7 @@
 package dev.naoki.nanogpt
 
+import java.nio.file.Files
+
 object InspectCli {
     @JvmStatic
     fun main(args: Array<String>) {
@@ -24,6 +26,14 @@ object InspectCli {
         println("n_embd=${metadata.modelConfig.nEmbd}")
         println("dropout=${metadata.modelConfig.dropout}")
         println("bias=${metadata.modelConfig.bias}")
+        println(
+            "optimizer_state=" +
+                Files.exists(
+                    metadata.directory
+                        .resolve(CheckpointFiles.OPTIMIZER_DIR)
+                        .resolve(CheckpointFiles.OPTIMIZER_MANIFEST),
+                ),
+        )
         if (state != null) {
             println("iter=${state.iter}")
             println("best_val_loss=${state.bestValLoss}")

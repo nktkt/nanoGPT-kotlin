@@ -1,24 +1,36 @@
 # nanoGPT Kotlin
 
-`nanoGPT-kotlin` is a Kotlin/JVM implementation of the core nanoGPT workflow. It can prepare character-level datasets, train a causal decoder-only transformer, resume from saved weights, inspect checkpoints, and generate text from saved models.
+`nanoGPT-kotlin` is a Kotlin/JVM port of the core [`karpathy/nanoGPT`](https://github.com/karpathy/nanoGPT) workflow. It prepares character-level datasets, trains decoder-only GPT models, resumes training with optimizer state, inspects checkpoints, samples text, and imports pretrained GPT-2 weights into native Kotlin checkpoints.
 
-The runtime uses [DJL](https://djl.ai/) with the PyTorch engine, so the project stays on the JVM while still using a mature tensor backend.
+The runtime is [DJL](https://djl.ai/) with the PyTorch engine, so the product stays on the JVM while using a mature tensor backend.
 
 ## What This Product Includes
 
-- A runnable CLI with `prepare`, `train`, `sample`, and `inspect` commands
-- Scratch training for GPT-style decoder models
+- A single CLI entrypoint with `prepare`, `train`, `sample`, `inspect`, and `import-gpt2`
+- Scratch training and pretrained GPT-2 initialization via `--init_from`
+- Causal self-attention, GELU MLP blocks, dropout, pre-layer normalization, and weight tying
 - Character-level dataset preparation to `train.bin`, `val.bin`, and `vocab.txt`
-- Weight tying, causal self-attention, GELU MLP blocks, dropout, and pre-layer normalization
 - Automatic checkpoint layout with `best/` and `latest/`
-- Weight-based resume support from `latest/` checkpoints
-- Executable shaded jar output from `mvn package`
+- Resume support with model weights, optimizer moments, update counts, and RNG state
+- A shaded runnable jar from `mvn package`
+
+## Parity Notes
+
+This project now covers the core single-process `nanoGPT` workflow on the JVM:
+
+- scratch training
+- GPT-2 initialization
+- checkpoint save/load
+- optimizer-state resume
+- text generation
+
+Important behavior note: resumed runs re-evaluate the current iteration after restart, matching upstream `nanoGPT`. Because of that, resumed `train loss` and `val loss` logs around the restart boundary can differ from a never-stopped run even when subsequent training updates are identical.
 
 ## Current Limits
 
-- Resume restores model weights and training metadata, but not optimizer state
-- Character-level preparation is included; GPT-2-tokenized dataset preparation is not
-- DDP, `torch.compile`, pretrained GPT-2 import, and W&B logging are still out of scope
+- Character-level data preparation is included; GPT-2-tokenized dataset preparation is not
+- DDP, `torch.compile`, and W&B logging are still out of scope
+- GPT-2 import expects Hugging Face safetensors for `gpt2`, `gpt2-medium`, `gpt2-large`, or `gpt2-xl`
 
 ## Build
 
@@ -27,7 +39,7 @@ cd nanoGPT-kotlin
 mvn package
 ```
 
-This produces a runnable jar at:
+This produces:
 
 ```bash
 target/nanogpt-kotlin-1.0.0.jar
@@ -53,6 +65,7 @@ Available commands:
 - `train`
 - `sample`
 - `inspect`
+- `import-gpt2`
 
 ## Prepare a Dataset
 
@@ -84,6 +97,7 @@ Or with explicit overrides:
 java -jar target/nanogpt-kotlin-1.0.0.jar train \
   --dataset_dir=data/shakespeare_char \
   --out_dir=out-shakespeare-char \
+  --init_from=scratch \
   --device=cpu \
   --batch_size=64 \
   --block_size=256 \
@@ -100,18 +114,69 @@ Training writes checkpoints to:
 
 ## Resume Training
 
-Resume from a previous run by pointing `resume_from` at the output directory or directly at a checkpoint slot:
+Resume from a previous run by pointing `resume_from` at either the root output directory or a specific checkpoint slot:
 
 ```bash
 java -jar target/nanogpt-kotlin-1.0.0.jar train \
   --dataset_dir=data/shakespeare_char \
   --out_dir=out-shakespeare-char-resumed \
+  --init_from=resume \
   --resume_from=out-shakespeare-char \
   --device=cpu \
   --max_iters=8000
 ```
 
 If you pass the root output directory, resume automatically prefers `latest/`.
+
+Resume restores:
+
+- model weights
+- optimizer mean / variance tensors
+- optimizer update counts
+- training RNG state
+- evaluation RNG state
+
+## Initialize From GPT-2
+
+You can initialize training directly from a pretrained GPT-2 checkpoint:
+
+```bash
+java -jar target/nanogpt-kotlin-1.0.0.jar train \
+  --dataset_dir=data/shakespeare_char \
+  --out_dir=out-gpt2-init \
+  --init_from=gpt2 \
+  --block_size=256 \
+  --dropout=0.0 \
+  --max_iters=1000
+```
+
+Supported model types:
+
+- `gpt2`
+- `gpt2-medium`
+- `gpt2-large`
+- `gpt2-xl`
+
+## Import GPT-2 Into a Native Kotlin Checkpoint
+
+To create a reusable native checkpoint from Hugging Face weights:
+
+```bash
+java -jar target/nanogpt-kotlin-1.0.0.jar import-gpt2 \
+  --model_type=gpt2 \
+  --output_dir=checkpoints/gpt2
+```
+
+If you already downloaded the safetensors files locally:
+
+```bash
+java -jar target/nanogpt-kotlin-1.0.0.jar import-gpt2 \
+  --model_type=gpt2 \
+  --source_dir=/path/to/huggingface-model-dir \
+  --output_dir=checkpoints/gpt2
+```
+
+This writes a standard checkpoint directory that can be used by `sample`, `inspect`, or `train --init_from=resume`.
 
 ## Inspect a Checkpoint
 
@@ -121,6 +186,8 @@ java -jar target/nanogpt-kotlin-1.0.0.jar inspect \
 ```
 
 If you pass the root output directory, inspection automatically resolves to `best/`.
+
+Inspection includes model metadata and whether optimizer state is present.
 
 ## Sample
 

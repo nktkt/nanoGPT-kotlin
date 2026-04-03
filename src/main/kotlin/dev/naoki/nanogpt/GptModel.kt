@@ -7,8 +7,7 @@ import ai.djl.ndarray.types.DataType
 import ai.djl.ndarray.types.Shape
 import ai.djl.nn.AbstractBlock
 import ai.djl.nn.Activation
-import ai.djl.nn.Block
-import ai.djl.nn.SequentialBlock
+import ai.djl.nn.Parameter
 import ai.djl.nn.core.Linear
 import ai.djl.nn.norm.Dropout
 import ai.djl.nn.norm.LayerNorm
@@ -73,6 +72,11 @@ class CausalSelfAttentionBlock(private val config: GptConfig) : AbstractBlock(VE
         return residDropout.forward(parameterStore, NDList(projected), training, params)
     }
 
+    fun qkvWeight(): Parameter = cAttn.parameters.get("weight")
+    fun qkvBias(): Parameter? = if (cAttn.parameters.contains("bias")) cAttn.parameters.get("bias") else null
+    fun projWeight(): Parameter = cProj.parameters.get("weight")
+    fun projBias(): Parameter? = if (cProj.parameters.contains("bias")) cProj.parameters.get("bias") else null
+
     private fun createHeads(array: NDArray, batch: Long, time: Long, headSize: Int): NDArray {
         return array.reshape(batch, time, config.nHead.toLong(), headSize.toLong()).transpose(0, 2, 1, 3)
     }
@@ -81,6 +85,51 @@ class CausalSelfAttentionBlock(private val config: GptConfig) : AbstractBlock(VE
         val positions = manager.arange(time.toInt())
         return positions.reshape(Shape(time, 1)).gte(positions.reshape(Shape(1, time)))
     }
+
+    companion object {
+        private const val VERSION: Byte = 1
+    }
+}
+
+class MlpBlock(private val config: GptConfig) : AbstractBlock(VERSION) {
+    private val cFc = addChildBlock(
+        "c_fc",
+        Linear.builder().setUnits((4 * config.nEmbd).toLong()).optBias(config.bias).build(),
+    )
+    private val gelu = addChildBlock("gelu", Activation.geluBlock())
+    private val cProj = addChildBlock(
+        "c_proj",
+        Linear.builder().setUnits(config.nEmbd.toLong()).optBias(config.bias).build(),
+    )
+    private val dropout = addChildBlock("dropout", Dropout.builder().optRate(config.dropout).build())
+
+    override fun getOutputShapes(inputShapes: Array<Shape>): Array<Shape> = arrayOf(inputShapes[0])
+
+    override fun initializeChildBlocks(manager: NDManager, dataType: DataType, vararg inputShapes: Shape) {
+        cFc.initialize(manager, DataType.FLOAT32, inputShapes[0])
+        val fcOutputShape = cFc.getOutputShapes(inputShapes)[0]
+        gelu.initialize(manager, DataType.FLOAT32, fcOutputShape)
+        cProj.initialize(manager, DataType.FLOAT32, fcOutputShape)
+        val projOutputShape = cProj.getOutputShapes(arrayOf(fcOutputShape))[0]
+        dropout.initialize(manager, DataType.FLOAT32, projOutputShape)
+    }
+
+    override fun forwardInternal(
+        parameterStore: ParameterStore,
+        inputs: NDList,
+        training: Boolean,
+        params: PairList<String, Any>?,
+    ): NDList {
+        var x = cFc.forward(parameterStore, inputs, training, params)
+        x = gelu.forward(parameterStore, x, training, params)
+        x = cProj.forward(parameterStore, x, training, params)
+        return dropout.forward(parameterStore, x, training, params)
+    }
+
+    fun fcWeight(): Parameter = cFc.parameters.get("weight")
+    fun fcBias(): Parameter? = if (cFc.parameters.contains("bias")) cFc.parameters.get("bias") else null
+    fun projWeight(): Parameter = cProj.parameters.get("weight")
+    fun projBias(): Parameter? = if (cProj.parameters.contains("bias")) cProj.parameters.get("bias") else null
 
     companion object {
         private const val VERSION: Byte = 1
@@ -97,14 +146,7 @@ class TransformerBlock(private val config: GptConfig) : AbstractBlock(VERSION) {
         "ln_2",
         LayerNorm.builder().axis(2).optCenter(config.bias).optScale(true).build(),
     )
-    private val mlp = addChildBlock(
-        "mlp",
-        SequentialBlock()
-            .add(Linear.builder().setUnits((4 * config.nEmbd).toLong()).optBias(config.bias).build())
-            .add(Activation.geluBlock())
-            .add(Linear.builder().setUnits(config.nEmbd.toLong()).optBias(config.bias).build())
-            .add(Dropout.builder().optRate(config.dropout).build()),
-    )
+    private val mlp = addChildBlock("mlp", MlpBlock(config))
 
     override fun getOutputShapes(inputShapes: Array<Shape>): Array<Shape> = arrayOf(inputShapes[0])
 
@@ -130,6 +172,13 @@ class TransformerBlock(private val config: GptConfig) : AbstractBlock(VERSION) {
             .singletonOrThrow()
         return NDList(x.add(mlpOut))
     }
+
+    fun ln1Weight(): Parameter = ln1.parameters.get("gamma")
+    fun ln1Bias(): Parameter? = if (ln1.parameters.contains("beta")) ln1.parameters.get("beta") else null
+    fun ln2Weight(): Parameter = ln2.parameters.get("gamma")
+    fun ln2Bias(): Parameter? = if (ln2.parameters.contains("beta")) ln2.parameters.get("beta") else null
+    fun attention(): CausalSelfAttentionBlock = attn
+    fun mlpBlock(): MlpBlock = mlp
 
     companion object {
         private const val VERSION: Byte = 1
@@ -190,6 +239,20 @@ class GptModel(private val config: GptConfig) : AbstractBlock(VERSION) {
         }
         x = finalNorm.forward(parameterStore, NDList(x), training, params).singletonOrThrow()
         return NDList(tokenEmbedding.probabilities(parameterStore, x, training))
+    }
+
+    fun tokenEmbeddingWeight(): Parameter = tokenEmbedding.parameters.get("embedding")
+    fun positionEmbeddingWeight(): Parameter = positionEmbedding.parameters.get("embedding")
+    fun finalNormWeight(): Parameter = finalNorm.parameters.get("gamma")
+    fun finalNormBias(): Parameter? = if (finalNorm.parameters.contains("beta")) finalNorm.parameters.get("beta") else null
+    fun transformerBlock(index: Int): TransformerBlock = blocks[index]
+    fun config(): GptConfig = config
+    fun parameterCount(nonEmbedding: Boolean = true): Long {
+        var total = getParameters().values().sumOf { it.array?.size() ?: 0L }
+        if (nonEmbedding) {
+            total -= positionEmbeddingWeight().array.size()
+        }
+        return total
     }
 
     companion object {

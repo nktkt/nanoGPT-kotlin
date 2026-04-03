@@ -1,8 +1,6 @@
 package dev.naoki.nanogpt
 
 import ai.djl.Device
-import java.io.InputStream
-import java.io.OutputStream
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.Properties
@@ -33,6 +31,7 @@ data class TrainConfig(
     val datasetDir: Path,
     val outDir: Path,
     val resumeFrom: Path? = null,
+    val initFrom: String = "scratch",
     val evalInterval: Int = 250,
     val logInterval: Int = 10,
     val evalIters: Int = 50,
@@ -52,6 +51,7 @@ data class TrainConfig(
     val beta1: Float = 0.9f,
     val beta2: Float = 0.99f,
     val gradClip: Float = 1.0f,
+    val decayLr: Boolean = true,
     val warmupIters: Int = 100,
     val lrDecayIters: Int = 5000,
     val minLr: Float = 1e-4f,
@@ -79,6 +79,9 @@ data class TrainConfig(
         require(warmupIters >= 0) { "warmup_iters must be non-negative" }
         require(lrDecayIters > 0) { "lr_decay_iters must be positive" }
         require(minLr >= 0f) { "min_lr must be non-negative" }
+        require(initFrom in setOf("scratch", "resume", "gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl")) {
+            "init_from must be one of scratch, resume, gpt2, gpt2-medium, gpt2-large, gpt2-xl"
+        }
     }
 
     fun deviceHandle(): Device {
@@ -100,6 +103,23 @@ data class TrainConfig(
             dropout = dropout,
             bias = bias,
         )
+    }
+}
+
+data class ImportGpt2Config(
+    val modelType: String,
+    val sourceDir: Path? = null,
+    val outputDir: Path,
+    val blockSize: Int = 1024,
+    val dropout: Float = 0.0f,
+    val seed: Int = 1337,
+) {
+    init {
+        require(modelType in setOf("gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl")) {
+            "model_type must be one of gpt2, gpt2-medium, gpt2-large, gpt2-xl"
+        }
+        require(blockSize > 0 && blockSize <= 1024) { "block_size must be between 1 and 1024 for GPT-2 imports" }
+        require(dropout in 0f..1f) { "dropout must be between 0 and 1" }
     }
 }
 
@@ -134,6 +154,9 @@ data class PrepareConfig(
 data class TrainingState(
     val iter: Int,
     val bestValLoss: Float,
+    val trainRngState: Long,
+    val trainEvalRngState: Long,
+    val valEvalRngState: Long,
 )
 
 object PropertiesIO {
@@ -153,6 +176,8 @@ object CheckpointFiles {
     const val MODEL_PREFIX = "nanogpt-kotlin"
     const val MODEL_PROPERTIES = "model.properties"
     const val STATE_PROPERTIES = "state.properties"
+    const val OPTIMIZER_DIR = "optimizer"
+    const val OPTIMIZER_MANIFEST = "optimizer.properties"
     const val VOCAB_FILE = "vocab.txt"
     const val BEST_DIR = "best"
     const val LATEST_DIR = "latest"

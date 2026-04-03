@@ -13,7 +13,6 @@ import java.nio.file.StandardOpenOption
 import kotlin.io.path.exists
 import kotlin.io.path.readText
 import kotlin.math.min
-import kotlin.random.Random
 
 private const val SEGMENT_BYTES: Long = 1L shl 30
 
@@ -76,7 +75,7 @@ class TokenDataset(private val datasetDir: Path) : Closeable {
         device: Device,
         batchSize: Int,
         blockSize: Int,
-        random: Random,
+        random: StatefulRandom,
     ): TokenBatch {
         val source = if (split == Split.TRAIN) train else validation
         require(source.tokenCount > blockSize.toLong()) {

@@ -59,6 +59,9 @@ object Checkpoints {
         return TrainingState(
             iter = props.getProperty("iter").toInt(),
             bestValLoss = props.getProperty("best_val_loss").toFloat(),
+            trainRngState = props.getProperty("train_rng_state", "0").toLong(),
+            trainEvalRngState = props.getProperty("train_eval_rng_state", "0").toLong(),
+            valEvalRngState = props.getProperty("val_eval_rng_state", "0").toLong(),
         )
     }
 
@@ -94,6 +97,9 @@ object Checkpoints {
         val stateProperties = Properties().apply {
             setProperty("iter", trainingState.iter.toString())
             setProperty("best_val_loss", trainingState.bestValLoss.toString())
+            setProperty("train_rng_state", trainingState.trainRngState.toString())
+            setProperty("train_eval_rng_state", trainingState.trainEvalRngState.toString())
+            setProperty("val_eval_rng_state", trainingState.valEvalRngState.toString())
         }
         PropertiesIO.store(
             outputDir.resolve(CheckpointFiles.MODEL_PROPERTIES),
